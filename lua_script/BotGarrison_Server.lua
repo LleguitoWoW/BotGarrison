@@ -101,6 +101,13 @@ local CFG = {
     LOGOUT_DELAY_MS = 500,
     LOGIN_DELAY_MS  = 1000,
     PARK_DELAY_MS   = 300,
+
+    -- Bloquear summon/follow de bots en mision
+    BLOCK_SUMMON_WHILE_MISSION = true,
+    -- Si el jugador igual los trae, re-aparcar cada X ms
+    MISSION_BOT_WATCHDOG_MS = 5000,
+    -- Si el bot esta a menos de estas yardas del master, se re-aparca
+    SUMMON_NEAR_YARDS = 80,
 }
 
 -- Misiones portadas desde BotQuest_Data.lua (original)
@@ -2326,6 +2333,7 @@ local function StartMission(player, quest)
         ready      = false,
     }
 
+    mission.masterGuid = player:GetGUID()
     ActiveMissions[guidStr] = mission
     SaveMissionToDB(player, mission)
 
@@ -2724,6 +2732,139 @@ RegisterGameObjectGossipEvent(GO_ENTRY, 2, OnGossipSelect)
 -- ============================================================
 --  LOGIN — misiones offline
 -- ============================================================
+
+-- ============================================================
+--  Anti-summon: bloquear comandos y re-aparcar si vuelven
+-- ============================================================
+local SUMMON_CMD_PATTERNS = {
+    "summon", "follow", "come", "bot add", "bots add",
+    "addclass", "teleport", "tele ", "come to me",
+    "co ", "follow me", "attack my target", -- algunos usamos follow
+}
+
+local function MissionBotNameSet(mission)
+    local set = {}
+    if not mission then return set end
+    if mission.botNames and mission.botNames ~= "" and mission.botNames ~= "Ninguno" then
+        for name in string.gmatch(mission.botNames, "[^,]+") do
+            name = name:match("^%s*(.-)%s*$")
+            if name and name ~= "" then set[name:lower()] = true end
+        end
+    end
+    return set
+end
+
+local function GetActiveMissionFor(player)
+    if not player then return nil end
+    local m = ActiveMissions[GuidKey(player)]
+    if m and not m.cancelled then return m end
+    return nil
+end
+
+local function ForceParkBot(player, bot)
+    if not player or not bot then return end
+    pcall(function()
+        local mgr = GetMasterBotMgr(player)
+        local name = bot:GetName()
+        if mgr and mgr.HandlePlayerbotCommand and name then
+            pcall(function() mgr:HandlePlayerbotCommand("bot " .. name .. " stay") end)
+        end
+        bot:Teleport(CFG.PARK_MAP or 13, CFG.PARK_X or 0, CFG.PARK_Y or 0, CFG.PARK_Z or 0, CFG.PARK_O or 0)
+    end)
+end
+
+local function CommandLooksLikeSummon(msg)
+    if not msg then return false end
+    local m = msg:lower()
+    -- quitar barra inicial de comandos
+    m = m:gsub("^%.", ""):gsub("^/", "")
+    for _, pat in ipairs(SUMMON_CMD_PATTERNS) do
+        if m:find(pat, 1, true) then return true end
+    end
+    return false
+end
+
+--- Evento comando (si el core lo dispara). return false = bloquear
+local function OnPlayerCommand(event, player, command)
+    if not CFG.BLOCK_SUMMON_WHILE_MISSION then return end
+    local mission = GetActiveMissionFor(player)
+    if not mission or mission.ready then return end
+    if not CommandLooksLikeSummon(command) then return end
+    player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Tus companeros estan de mision. No puedes llamarlos hasta reclamar el resultado en el mapa.")
+    return false
+end
+
+--- Watchdog: si un bot de mision esta cerca del master o fuera del mapa park, lo devuelve
+local function MissionBotWatchdog()
+    if not CFG.BLOCK_SUMMON_WHILE_MISSION then return end
+    local near = CFG.SUMMON_NEAR_YARDS or 80
+    for guidStr, mission in pairs(ActiveMissions) do
+        if mission and not mission.cancelled and not mission.ready then
+            local player = nil
+            if mission.masterGuid and GetPlayerByGUID then
+                local ok, pl = pcall(function() return GetPlayerByGUID(mission.masterGuid) end)
+                if ok then player = pl end
+            end
+            if player then
+                local names = MissionBotNameSet(mission)
+                if next(names) ~= nil then
+                    local bots = {}
+                    local group = player:GetGroup()
+                    if group then
+                        local members = group:GetMembers()
+                        if members then
+                            for _, mem in pairs(members) do
+                                local okN, n = pcall(function() return mem:GetName() end)
+                                if okN and n and names[n:lower()] then
+                                    bots[#bots+1] = mem
+                                end
+                            end
+                        end
+                    end
+                    local mgr = GetMasterBotMgr(player)
+                    if mgr and mgr.GetPlayerBots then
+                        local okList, list = pcall(function() return mgr:GetPlayerBots() end)
+                        if okList and list then
+                            for _, b in pairs(list) do
+                                local okN, n = pcall(function() return b:GetName() end)
+                                if okN and n and names[n:lower()] then
+                                    local already = false
+                                    for _, x in ipairs(bots) do
+                                        if x == b then already = true break end
+                                    end
+                                    if not already then bots[#bots+1] = b end
+                                end
+                            end
+                        end
+                    end
+                    local warned = false
+                    for _, bot in ipairs(bots) do
+                        local needPark = false
+                        local okMap, bmap = pcall(function() return bot:GetMapId() end)
+                        if okMap and bmap ~= (CFG.PARK_MAP or 13) then
+                            needPark = true
+                        end
+                        if not needPark then
+                            local okD, dist = pcall(function() return player:GetDistance(bot) end)
+                            if okD and dist and dist < near then
+                                needPark = true
+                            end
+                        end
+                        if needPark then
+                            ForceParkBot(player, bot)
+                            if not warned then
+                                player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Un companero intento volver: sigue de mision. Reclama en el mapa cuando acabe.")
+                                warned = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+
 local function OnPlayerLogin(event, player)
     local guidStr = GuidKey(player)
 
@@ -2777,16 +2918,39 @@ RegisterPlayerEvent(3, OnPlayerLogin)
 --  GM: .bg reload
 -- ============================================================
 local function OnChat(event, player, msg)
-    if not player:IsGM() then return end
-    if msg == ".bg reload" or msg == ".botgarrison reload" then
+    if not player or not msg then return end
+
+    -- GM reload
+    if player:IsGM() and (msg == ".bg reload" or msg == ".botgarrison reload") then
         PoolsReady = false
         LoadAllItemPools()
         player:SendBroadcastMessage("|cff00ff00[BotGarrison]|r Pools recargados.")
         return false
     end
+
+    -- Bloquear summon/follow mientras hay mision activa (no lista para reclamar)
+    if CFG.BLOCK_SUMMON_WHILE_MISSION then
+        local mission = GetActiveMissionFor(player)
+        if mission and not mission.ready and CommandLooksLikeSummon(msg) then
+            player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Tus companeros estan de mision. No puedes llamarlos hasta reclamar el resultado en el mapa.")
+            return false
+        end
+    end
 end
 RegisterPlayerEvent(18, OnChat)
 
+-- Comandos tipo .bot / .playerbot (si el core emite ON_COMMAND)
+pcall(function()
+    RegisterPlayerEvent(42, OnPlayerCommand) -- PLAYER_EVENT_ON_COMMAND
+end)
+
+-- Watchdog re-park
+if (CFG.MISSION_BOT_WATCHDOG_MS or 0) > 0 then
+    CreateLuaEvent(function()
+        pcall(MissionBotWatchdog)
+    end, CFG.MISSION_BOT_WATCHDOG_MS, 0)
+end
+
 CreateLuaEvent(function() LoadAllItemPools() end, 3000, 1)
 
-print("[BotGarrison] v0.7.4 cargado")
+print("[BotGarrison] v0.7.7 cargado — anti-summon en mision")
