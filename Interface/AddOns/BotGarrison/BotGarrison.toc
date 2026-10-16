@@ -1,0 +1,8 @@
+## Interface: 30300
+## Title: BotGarrison
+## Notes: Seguimiento de misiones de companeros (Playerbots)
+## Author: Lleguito
+## Version: 1.5.0
+## OptionalDeps: AIO
+
+BotGarrison.lua
