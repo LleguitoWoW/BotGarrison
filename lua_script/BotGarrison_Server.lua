@@ -1284,6 +1284,7 @@ local FailCooldowns  = {}   -- [guidStr] = expiry unix
 local ActiveMissions = {}   -- [guidStr] = mission table
 local QuestListCD    = {}   -- [guidStr] = { [questId] = expiry unix }
 local GossipContext  = {}   -- [guidStr] = { page, list }
+local SendMissionStatus      -- (definida al final: envia el estado al addon via AIO)
 
 -- ============================================================
 --  POOLS DE ÍTEMS
@@ -1525,6 +1526,21 @@ local function CollectBotNames(bots)
     return names
 end
 
+--- Saludo one-shot. 66 = EMOTE_ONESHOT_SALUTE (es el mismo para /salute, /saludar...:
+--- el nombre del comando depende del idioma del cliente, el servidor usa el numero).
+--- En Eluna de AzerothCore el metodo es Unit:PerformEmote (Unit:Emote NO existe).
+local function BotSalute(unit, label)
+    if not unit then return false end
+    pcall(function()
+        if unit.EmoteState then unit:EmoteState(0) end
+    end)
+    local ok, err = pcall(function() unit:PerformEmote(66) end)
+    if not ok then
+        print(string.format("[BotGarrison] Saludo de '%s' fallo: %s", tostring(label), tostring(err)))
+    end
+    return ok
+end
+
 --- Aparca bots lejos (modo park) o logout (modo logout)
 local function DismissBotsOnMission(player, bots)
     local mode = CFG.BOT_MISSION_MODE or "park"
@@ -1576,39 +1592,45 @@ local function DismissBotsOnMission(player, bots)
             end
 
             if mode == "park" and bot then
-                -- Un solo saludo one-shot. EmoteState(66) dejaba el gesto EN BUCLE.
-                pcall(function()
-                    if bot.EmoteState then bot:EmoteState(0) end
-                end)
-                pcall(function()
-                    if bot.HandleEmoteCommand then
-                        bot:HandleEmoteCommand(66)
-                    elseif bot.Emote then
-                        bot:Emote(66)
-                    end
-                end)
-
                 local botGuid = bot:GetGUID()
                 local botName = info.name
-                -- stay + teleport DESPUES del saludo (si no, cancelan la animacion)
-                CreateLuaEvent(function()
+
+                -- Localiza al bot de nuevo (los objetos pueden invalidarse entre eventos)
+                local function findBot()
                     local b = GetPlayerByGUID and GetPlayerByGUID(botGuid) or nil
                     if not b and GetPlayerByName then
                         local ok, bb = pcall(function() return GetPlayerByName(botName) end)
                         if ok then b = bb end
                     end
+                    return b
+                end
+
+                -- 1) Parar al bot YA: si sigue moviendose/siguiendo, el movimiento cancela el saludo
+                pcall(function()
+                    if mgr and mgr.HandlePlayerbotCommand then
+                        mgr:HandlePlayerbotCommand("bot " .. botName .. " stay")
+                    end
+                end)
+
+                -- 2) Saludo one-shot (66 = SALUTE) mirando al jugador. Se lanza tras un
+                --    instante para que el "stay" ya haya parado al bot.
+                CreateLuaEvent(function()
+                    local b = findBot()
                     if not b then return end
                     pcall(function()
-                        if b.EmoteState then b:EmoteState(0) end
+                        if b.SetFacingToObject then b:SetFacingToObject(p) end
                     end)
-                    local m = GetMasterBotMgr(p)
-                    if m and m.HandlePlayerbotCommand then
-                        pcall(function() m:HandlePlayerbotCommand("bot " .. botName .. " stay") end)
-                    end
+                    BotSalute(b, botName)
+                end, 500, 1)
+
+                -- 3) Teleport al aparcamiento cuando el saludo ya termino (~3 s despues)
+                CreateLuaEvent(function()
+                    local b = findBot()
+                    if not b then return end
                     pcall(function()
                         b:Teleport(CFG.PARK_MAP or 13, CFG.PARK_X or 0, CFG.PARK_Y or 0, CFG.PARK_Z or 0, CFG.PARK_O or 0)
                     end)
-                end, 2000, 1)
+                end, 3500, 1)
                 print(string.format("[BotGarrison] Park bot '%s' → map %s (salute)", info.name, tostring(CFG.PARK_MAP)))
             elseif mode == "logout" then
                 local done = false
@@ -1683,16 +1705,7 @@ local function RecallBotsFromMission(player, mission)
                         mgr:HandlePlayerbotCommand("bot " .. name .. " follow")
                     end
                 end)
-                pcall(function()
-                    if bot.EmoteState then bot:EmoteState(0) end
-                end)
-                pcall(function()
-                    if bot.HandleEmoteCommand then
-                        bot:HandleEmoteCommand(66)
-                    elseif bot.Emote then
-                        bot:Emote(66)
-                    end
-                end)
+                BotSalute(bot, name)
                 print(string.format("[BotGarrison] Recall park '%s' → %s (salute)", name, tostring(ok)))
                 return ok
             end
@@ -2247,7 +2260,6 @@ local function ResolveMission(player, mission)
     if success then
         mission.chance = chance
         DeliverRewards(player, mission)
-        PlayMissionCompleteSound(player)
         -- CD de lista: esta mision no vuelve a salir 15 min
         SetQuestListCD(guidStr, qid, CFG.MISSION_LIST_CD or 900)
         player:SendBroadcastMessage(string.format(
@@ -2268,6 +2280,7 @@ local function ResolveMission(player, mission)
 
     ActiveMissions[guidStr] = nil
     ClearMissionDB(player)
+    SendMissionStatus(player)
 end
 
 local function StartMission(player, quest)
@@ -2334,8 +2347,11 @@ local function StartMission(player, quest)
     }
 
     mission.masterGuid = player:GetGUID()
+    -- Margen para que los bots hagan el saludo antes de que el watchdog los vigile
+    mission.graceUntil = os.time() + 10
     ActiveMissions[guidStr] = mission
     SaveMissionToDB(player, mission)
+    SendMissionStatus(player)
 
     -- Desconectar altbots para simular que están de misión
     local dismissed = DismissBotsOnMission(player, bots)
@@ -2364,6 +2380,8 @@ local function StartMission(player, quest)
         local p = GetPlayerByGUID(fullGuid)
         if p then
             p:SendBroadcastMessage("|cff00ff00[BotGarrison]|r !! Mision lista! Vuelve al tablon y reclama el resultado.")
+            SendMissionStatus(p)
+            PlayMissionCompleteSound(p)
             if p.SendNotification then
                 pcall(function()
                     p:SendNotification("BotGarrison: Mision lista para reclamar!")
@@ -2410,6 +2428,7 @@ local function CancelMission(player)
     RecallBotsFromMission(player, m)
     ActiveMissions[guidStr] = nil
     ClearMissionDB(player)
+    SendMissionStatus(player)
     player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Misión cancelada. Compañeros de vuelta. Sin recompensa.")
 end
 
@@ -2799,7 +2818,8 @@ local function MissionBotWatchdog()
     if not CFG.BLOCK_SUMMON_WHILE_MISSION then return end
     local near = CFG.SUMMON_NEAR_YARDS or 80
     for guidStr, mission in pairs(ActiveMissions) do
-        if mission and not mission.cancelled and not mission.ready then
+        if mission and not mission.cancelled and not mission.ready
+            and os.time() >= (mission.graceUntil or 0) then
             local player = nil
             if mission.masterGuid and GetPlayerByGUID then
                 local ok, pl = pcall(function() return GetPlayerByGUID(mission.masterGuid) end)
@@ -2892,6 +2912,12 @@ local function OnPlayerLogin(event, player)
         player:SendBroadcastMessage(string.format(
             "|cff00ff00[BotGarrison]|r !! Mision lista: |cffffcc00%s|r - ve al tablon y reclama el resultado.",
             mission.questName or "?"))
+        -- Cuerno: la mision termino mientras estabas desconectado (esperar a que cargue el mundo)
+        local loginGuid = player:GetGUID()
+        CreateLuaEvent(function()
+            local p = GetPlayerByGUID(loginGuid)
+            if p then PlayMissionCompleteSound(p) end
+        end, 4000, 1)
     else
         local rem = mission.endTime - os.time()
         player:SendBroadcastMessage(string.format(
@@ -2908,6 +2934,8 @@ local function OnPlayerLogin(event, player)
             local p = GetPlayerByGUID(fullGuid)
             if p then
                 p:SendBroadcastMessage("|cff00ff00[BotGarrison]|r !! Mision lista! Reclama en el tablon.")
+                SendMissionStatus(p)
+                PlayMissionCompleteSound(p)
             end
         end, rem * 1000, 1)
     end
@@ -2953,4 +2981,57 @@ end
 
 CreateLuaEvent(function() LoadAllItemPools() end, 3000, 1)
 
-print("[BotGarrison] v0.7.7 cargado — anti-summon en mision")
+-- ============================================================
+--  AIO: comunicacion con el addon cliente (panel + minimapa)
+-- ============================================================
+local AIO = AIO or require("AIO")
+local BGHandlers = AIO.AddHandlers("BotGarrison", {})
+
+SendMissionStatus = function(player)
+    if not player then return end
+    local data = { active = false }
+    local m = ActiveMissions[GuidKey(player)]
+    if m and not m.cancelled then
+        local now = os.time()
+        if not m.ready and now >= (m.endTime or 0) then m.ready = true end
+        local q = FindQuest(m.questId)
+        local lvl = player:GetLevel()
+        local multCfg = CFG.GOLD_LEVEL_MULT or 0
+        local mult = (multCfg > 0) and (multCfg * lvl) or 1
+        local gLo = math.floor((m.goldMin or 50) * mult)
+        local gHi = math.floor((m.goldMax or 100) * mult)
+        data = {
+            active      = true,
+            name        = m.questName or "?",
+            difficulty  = m.difficulty,
+            diffLabel   = DIFF_LABEL[m.difficulty] or m.difficulty,
+            desc        = (q and q.desc) or "",
+            bots        = m.botNames or "",
+            goldMinStr  = FormatCopper(gLo),
+            goldMaxStr  = FormatCopper(gHi),
+            itemFlavor  = REWARD_ITEM_FLAVOR[m.difficulty] or "",
+            chance      = m.chance or 0,
+            remaining   = math.max(0, (m.endTime or now) - now),
+            total       = m.duration or 0,
+            ready       = m.ready and true or false,
+        }
+    end
+    AIO.Handle(player, "BotGarrison", "UpdateStatus", data)
+end
+
+function BGHandlers.requestStatus(player)
+    -- cargar de BD si aun no esta en memoria (p.ej. tras login)
+    local guidStr = GuidKey(player)
+    if not ActiveMissions[guidStr] then
+        local m = LoadMissionFromDB(player)
+        if m then ActiveMissions[guidStr] = m end
+    end
+    SendMissionStatus(player)
+end
+
+function BGHandlers.claimMission(player)
+    ClaimMission(player)
+    SendMissionStatus(player)
+end
+
+print("[BotGarrison] v0.7.7 cargado — anti-summon en mision + AIO")
