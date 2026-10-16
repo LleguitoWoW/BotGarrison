@@ -17,6 +17,17 @@ local GO_ENTRY = 900100
 --  CONFIG
 -- ============================================================
 local CFG = {
+    USE_PANEL              = true,   -- true: el tablon abre el panel AIO; false: menu de gossip clasico
+    -- Panel: ¿se puede elegir y enviar misiones SIN estar junto al tablon?
+    --   false (defecto): solo desde el tablon. El panel solo funciona si estas a menos de
+    --                    BOARD_RANGE yardas de donde pulsaste el tablon; si te alejas, se cierra
+    --                    la vista de ofertas y no se puede enviar.
+    --   true           : /bg y el icono del minimapa tambien muestran el tablon y permiten
+    --                    enviar desde cualquier sitio.
+    PANEL_REMOTE_BOARD     = false,
+    BOARD_RANGE            = 12,     -- yardas maximas desde el tablon (si PANEL_REMOTE_BOARD=false)
+    DIARY_ENABLED          = true,   -- envia cada mision resuelta al "Mi Diario" del addon (se guarda en el cliente, no en la BD)
+    SALUTE_FACE_PLAYER     = true,   -- los bots se giran hacia ti antes de saludar (false: saludan sin girarse)
     QUALITIES              = { 1, 2, 3 },
     ITEM_CLASSES           = { 2, 4 },
     ARMOR_SUBCLASS_EXCLUDE = { 0, 11, 12, 13, 14 },
@@ -1282,9 +1293,26 @@ local QUALITY_NAME    = { [1]="Común", [2]="Poco común", [3]="Raro" }
 
 local FailCooldowns  = {}   -- [guidStr] = expiry unix
 local ActiveMissions = {}   -- [guidStr] = mission table
+local MissionLoaded  = {}   -- [guidStr] = true: ya se consulto la BD (el DELETE es asincrono; no releer)
 local QuestListCD    = {}   -- [guidStr] = { [questId] = expiry unix }
 local GossipContext  = {}   -- [guidStr] = { page, list }
 local SendMissionStatus      -- (definida al final: envia el estado al addon via AIO)
+local BoardOpen              -- (definida al final: abre el panel del tablon via AIO)
+local SendDiaryEntry         -- (definida al final: manda una entrada al diario del addon via AIO)
+
+-- Envuelve una funcion (evento diferido o handler AIO): si falla, lo imprime con el
+-- nombre y la traza en vez de dejar un error suelto sin contexto.
+local function Guard(label, fn)
+    return function(...)
+        local args = { ... }
+        local n = select("#", ...)
+        local ok, err = xpcall(function() return fn(unpack(args, 1, n)) end, function(e)
+            local tb = (debug and debug.traceback) and debug.traceback("", 2) or ""
+            return tostring(e) .. tb
+        end)
+        if not ok then print("[BotGarrison] ERROR en " .. label .. ": " .. tostring(err)) end
+    end
+end
 
 -- ============================================================
 --  POOLS DE ÍTEMS
@@ -1563,7 +1591,7 @@ local function DismissBotsOnMission(player, bots)
         end
     end
 
-    CreateLuaEvent(function()
+    CreateLuaEvent(Guard("dismiss-bots", function()
         local p = GetPlayerByGUID(masterGuid)
         if not p then return end
         local mgr = GetMasterBotMgr(p)
@@ -1612,25 +1640,35 @@ local function DismissBotsOnMission(player, bots)
                     end
                 end)
 
-                -- 2) Saludo one-shot (66 = SALUTE) mirando al jugador. Se lanza tras un
-                --    instante para que el "stay" ya haya parado al bot.
-                CreateLuaEvent(function()
+                -- 2) Girarse hacia el jugador. Va SEPARADO del saludo: si el giro y el emote
+                --    coinciden en el mismo instante, el giro cancela la animacion.
+                local faceOn = (CFG.SALUTE_FACE_PLAYER ~= false)
+                if faceOn then
+                    CreateLuaEvent(Guard("salute-face", function()
+                        local b = findBot()
+                        if not b then return end
+                        pcall(function()
+                            local pl = GetPlayerByGUID(masterGuid)
+                            if b.SetFacingToObject and pl then b:SetFacingToObject(pl) end
+                        end)
+                    end), 400, 1)
+                end
+
+                -- 3) Saludo one-shot (66 = SALUTE), ya parado y (si procede) ya girado
+                CreateLuaEvent(Guard("salute", function()
                     local b = findBot()
                     if not b then return end
-                    pcall(function()
-                        if b.SetFacingToObject then b:SetFacingToObject(p) end
-                    end)
                     BotSalute(b, botName)
-                end, 500, 1)
+                end), faceOn and 1100 or 500, 1)
 
-                -- 3) Teleport al aparcamiento cuando el saludo ya termino (~3 s despues)
-                CreateLuaEvent(function()
+                -- 4) Teleport al aparcamiento cuando el saludo ya termino
+                CreateLuaEvent(Guard("park-teleport", function()
                     local b = findBot()
                     if not b then return end
                     pcall(function()
                         b:Teleport(CFG.PARK_MAP or 13, CFG.PARK_X or 0, CFG.PARK_Y or 0, CFG.PARK_Z or 0, CFG.PARK_O or 0)
                     end)
-                end, 3500, 1)
+                end), 3500, 1)
                 print(string.format("[BotGarrison] Park bot '%s' → map %s (salute)", info.name, tostring(CFG.PARK_MAP)))
             elseif mode == "logout" then
                 local done = false
@@ -1647,7 +1685,7 @@ local function DismissBotsOnMission(player, bots)
                 print(string.format("[BotGarrison] Logout bot '%s' ok=%s", info.name, tostring(done)))
             end
         end
-    end, delay, 1)
+    end), delay, 1)
 
     return #botData
 end
@@ -1681,7 +1719,7 @@ local function RecallBotsFromMission(player, mission)
     local masterGuid = player:GetGUID()
     local delay = (mode == "park") and (CFG.PARK_DELAY_MS or 300) or (CFG.LOGIN_DELAY_MS or 1000)
 
-    CreateLuaEvent(function()
+    CreateLuaEvent(Guard("recall-bots", function()
         local p = GetPlayerByGUID(masterGuid)
         if not p then
             print("[BotGarrison] Recall: jugador offline, abort")
@@ -1758,7 +1796,7 @@ local function RecallBotsFromMission(player, mission)
                 p:SendBroadcastMessage("|cffffcc00[BotGarrison]|r Si no han vuelto, usa: .playerbots bot add <nombre>")
             end
         end
-    end, delay, 1)
+    end), delay, 1)
 
     return math.max(#names, #guidLows)
 end
@@ -2164,7 +2202,7 @@ local function GrantMissionXP(player, mission)
     -- Esperar a que el park devuelva a los bots
     local delay = (CFG.PARK_DELAY_MS or 300) + 500
 
-    CreateLuaEvent(function()
+    CreateLuaEvent(Guard("grant-xp", function()
         local p = GetPlayerByGUID(masterGuid)
         if not p then return end
 
@@ -2214,7 +2252,7 @@ local function GrantMissionXP(player, mission)
         if botXpGiven > 0 then
             p:SendBroadcastMessage(string.format("|cff00ff00[BotGarrison]|r Experiencia (compañeros): |cffffffff+%d|r total", botXpGiven))
         end
-    end, delay, 1)
+    end), delay, 1)
 end
 
 local function DeliverRewards(player, mission)
@@ -2235,6 +2273,7 @@ local function DeliverRewards(player, mission)
         qColor, itemName, qName))
 
     GrantMissionXP(player, mission)
+    return gold, itemId, itemName, quality
 end
 
 local function ResolveMission(player, mission)
@@ -2257,9 +2296,22 @@ local function ResolveMission(player, mission)
     player:SendBroadcastMessage("|cff00ff00[BotGarrison]|r ¡Tus compañeros han regresado!")
 
     local qid = NormQuestId(mission.questId)
+    -- Entrada para "Mi Diario" (el addon la guarda en el cliente)
+    local entry = {
+        t      = os.time(),
+        name   = mission.questName or ("Mision #" .. tostring(qid)),
+        diff   = mission.difficulty or "NORMAL",
+        ok     = success and true or false,
+        bots   = mission.botNames or "",
+        chance = math.floor((chance or 0) * 100 + 0.5),
+    }
     if success then
         mission.chance = chance
-        DeliverRewards(player, mission)
+        local gold, itemId, itemName, quality = DeliverRewards(player, mission)
+        entry.gold     = gold or 0
+        entry.itemId   = itemId
+        entry.itemName = itemName
+        entry.quality  = quality
         -- CD de lista: esta mision no vuelve a salir 15 min
         SetQuestListCD(guidStr, qid, CFG.MISSION_LIST_CD or 900)
         player:SendBroadcastMessage(string.format(
@@ -2278,9 +2330,14 @@ local function ResolveMission(player, mission)
             mission.questName or ("#" .. tostring(qid)), math.ceil(half / 60)))
     end
 
+    MissionLoaded[guidStr] = true
     ActiveMissions[guidStr] = nil
     ClearMissionDB(player)
     SendMissionStatus(player)
+    if CFG.DIARY_ENABLED and SendDiaryEntry then
+        local okD, errD = pcall(SendDiaryEntry, player, entry)
+        if not okD then print("[BotGarrison] Diario: " .. tostring(errD)) end
+    end
 end
 
 local function StartMission(player, quest)
@@ -2373,7 +2430,7 @@ local function StartMission(player, quest)
     -- Al acabar el tiempo: queda LISTA para reclamar (estilo Garrison), no se resuelve sola
     local fullGuid = player:GetGUID()
     local capturedQuestId = quest.id
-    CreateLuaEvent(function()
+    CreateLuaEvent(Guard("mission-ready", function()
         local m = ActiveMissions[guidStr]
         if not m or m.cancelled or m.questId ~= capturedQuestId then return end
         m.ready = true
@@ -2390,7 +2447,7 @@ local function StartMission(player, quest)
         end
         print(string.format("[BotGarrison] Mision lista para reclamar: %s (%s)",
             m.questName or "?", guidStr))
-    end, duration * 1000, 1)
+    end), duration * 1000, 1)
 
     return true
 end
@@ -2426,6 +2483,7 @@ local function CancelMission(player)
     end
     m.cancelled = true
     RecallBotsFromMission(player, m)
+    MissionLoaded[guidStr] = true
     ActiveMissions[guidStr] = nil
     ClearMissionDB(player)
     SendMissionStatus(player)
@@ -2687,6 +2745,10 @@ local function GossipShowQuestDetail(player, go, index)
 end
 
 local function OnGossipHello(event, player, go)
+    if CFG.USE_PANEL and BoardOpen and BoardOpen(player) then
+        player:GossipComplete()
+        return true
+    end
     GossipShowMain(player, go)
     return true
 end
@@ -2892,6 +2954,7 @@ local function OnPlayerLogin(event, player)
     LoadQuestListCDFromDB(player)
 
     -- Cargar misión desde BD si no está en memoria
+    MissionLoaded[guidStr] = true
     if not ActiveMissions[guidStr] then
         local m = LoadMissionFromDB(player)
         if m then ActiveMissions[guidStr] = m end
@@ -2914,10 +2977,10 @@ local function OnPlayerLogin(event, player)
             mission.questName or "?"))
         -- Cuerno: la mision termino mientras estabas desconectado (esperar a que cargue el mundo)
         local loginGuid = player:GetGUID()
-        CreateLuaEvent(function()
+        CreateLuaEvent(Guard("login-horn", function()
             local p = GetPlayerByGUID(loginGuid)
             if p then PlayMissionCompleteSound(p) end
-        end, 4000, 1)
+        end), 4000, 1)
     else
         local rem = mission.endTime - os.time()
         player:SendBroadcastMessage(string.format(
@@ -2927,7 +2990,7 @@ local function OnPlayerLogin(event, player)
         -- Reprogramar: al acabar queda lista (no se resuelve sola)
         local fullGuid = player:GetGUID()
         local capturedQuestId = mission.questId
-        CreateLuaEvent(function()
+        CreateLuaEvent(Guard("login-ready", function()
             local m = ActiveMissions[guidStr]
             if not m or m.cancelled or m.questId ~= capturedQuestId then return end
             m.ready = true
@@ -2937,7 +3000,7 @@ local function OnPlayerLogin(event, player)
                 SendMissionStatus(p)
                 PlayMissionCompleteSound(p)
             end
-        end, rem * 1000, 1)
+        end), rem * 1000, 1)
     end
 end
 RegisterPlayerEvent(3, OnPlayerLogin)
@@ -2987,8 +3050,20 @@ CreateLuaEvent(function() LoadAllItemPools() end, 3000, 1)
 local AIO = AIO or require("AIO")
 local BGHandlers = AIO.AddHandlers("BotGarrison", {})
 
-SendMissionStatus = function(player)
-    if not player then return end
+-- Carga la mision de la BD UNA sola vez por jugador. Releerla siempre resucitaba
+-- misiones recien reclamadas (el DELETE es asincrono y el SELECT es inmediato).
+local function EnsureMissionLoaded(player)
+    local guidStr = GuidKey(player)
+    if MissionLoaded[guidStr] then return end
+    MissionLoaded[guidStr] = true
+    if not ActiveMissions[guidStr] then
+        local m = LoadMissionFromDB(player)
+        if m then ActiveMissions[guidStr] = m end
+    end
+end
+
+-- Datos de la mision activa (o { active = false }) para el addon
+local function MissionData(player)
     local data = { active = false }
     local m = ActiveMissions[GuidKey(player)]
     if m and not m.cancelled then
@@ -3016,22 +3091,211 @@ SendMissionStatus = function(player)
             ready       = m.ready and true or false,
         }
     end
-    AIO.Handle(player, "BotGarrison", "UpdateStatus", data)
+    return data
 end
 
-function BGHandlers.requestStatus(player)
-    -- cargar de BD si aun no esta en memoria (p.ej. tras login)
+SendMissionStatus = function(player)
+    if not player then return end
+    AIO.Handle(player, "BotGarrison", "UpdateStatus", MissionData(player))
+end
+
+-- Una entrada de "Mi Diario" para el addon (el cliente la guarda con SavedVariables)
+SendDiaryEntry = function(player, entry)
+    if not player or not entry then return end
+    AIO.Handle(player, "BotGarrison", "DiaryEntry", entry)
+end
+
+BGHandlers.requestStatus = Guard("requestStatus", function(player)
+    EnsureMissionLoaded(player)
+    SendMissionStatus(player)
+end)
+
+-- ------------------------------------------------------------
+--  TABLON con panel propio (sustituye al menu de gossip)
+-- ------------------------------------------------------------
+-- Sesion de tablon: se crea al pulsar el objeto. Guarda la lista de ofertas
+-- y donde estaba el jugador (para exigir que siga cerca al enviar).
+local BoardSession = {}   -- [guidStr] = { list, t, map, x, y }
+local BOARD_TTL    = 1800 -- segundos de validez de la sesion
+
+local function BoardNear(player, s)
+    if CFG.PANEL_REMOTE_BOARD then return true end   -- envio remoto permitido
+    if not s or not s.t then return false end
+    if os.time() - s.t > BOARD_TTL then return false end
+    local range = CFG.BOARD_RANGE or 12
+    local ok, res = pcall(function()
+        if player:GetMapId() ~= s.map then return false end
+        local dx, dy = player:GetX() - s.x, player:GetY() - s.y
+        return (dx * dx + dy * dy) <= (range * range)
+    end)
+    if not ok then return false end   -- si no se puede comprobar, no se permite
+    return res
+end
+
+local function BuildBoardPayload(player, open)
     local guidStr = GuidKey(player)
-    if not ActiveMissions[guidStr] then
-        local m = LoadMissionFromDB(player)
-        if m then ActiveMissions[guidStr] = m end
+    EnsureMissionLoaded(player)
+
+    local bots = GetAltBots(player)
+    local power, _, _, botCount, _, undergeared, avgGs, captainGs = CalculateGroupPower(player, bots)
+    local tanks, healers, dps = CountBotRoles(bots)
+
+    local payload = {
+        open    = open and true or false,
+        near    = false,
+        mission = MissionData(player),
+        cd      = GetRemainingCooldown(guidStr),
+        offers  = {},
+        listCD  = {},
+        group   = {
+            bots     = botCount or 0,
+            max      = CFG.MAX_MISSION_BOTS or 4,
+            tanks    = tanks or 0,
+            healers  = healers or 0,
+            dps      = dps or 0,
+            gs       = math.floor(avgGs or 0),
+            captain  = math.floor(captainGs or 0),
+            power    = math.floor((power or 0) * 10) / 10,
+            under    = undergeared and true or false,
+        },
+    }
+
+    local s = BoardSession[guidStr]
+    if open or (CFG.PANEL_REMOTE_BOARD and not s) then
+        s = {
+            t = os.time(), list = nil,
+            map = player:GetMapId(), x = player:GetX(), y = player:GetY(),
+        }
+        BoardSession[guidStr] = s
     end
-    SendMissionStatus(player)
+
+    if not (s and BoardNear(player, s)) then
+        return payload
+    end
+    payload.near = true
+
+    if not payload.mission.active then
+        if not s.list then s.list = BuildOfferList(player) end
+        local lvl = player:GetLevel()
+        local multCfg = CFG.GOLD_LEVEL_MULT or 0
+        local mult = (multCfg > 0) and (multCfg * lvl) or 1
+
+        for i, q in ipairs(s.list) do
+            local chance = CalculateSuccessChance(power, q.difficulty, undergeared)
+            local okReq, reqMsg = CheckQuestRequirements(q, bots)
+
+            local reqParts = {}
+            if (q.minBots or 0) > 0 then reqParts[#reqParts+1] = (q.minBots or 0) .. " bots" end
+            if (q.minTank or 0) > 0 then reqParts[#reqParts+1] = (q.minTank or 0) .. " tank" end
+            if (q.minHealer or 0) > 0 then reqParts[#reqParts+1] = (q.minHealer or 0) .. " healer" end
+            if (q.minDps or 0) > 0 then reqParts[#reqParts+1] = (q.minDps or 0) .. " dps" end
+
+            payload.offers[#payload.offers + 1] = {
+                idx        = i,
+                name       = q.name or "?",
+                desc       = q.desc or "",
+                diff       = q.difficulty or "NORMAL",
+                diffLabel  = DIFF_LABEL[q.difficulty] or q.difficulty or "",
+                minutes    = math.ceil((q.duration or 60) / 60),
+                chance     = chance or 0,
+                goldMinStr = FormatCopper(math.floor((q.goldMin or 50) * mult)),
+                goldMaxStr = FormatCopper(math.floor((q.goldMax or 100) * mult)),
+                itemFlavor = REWARD_ITEM_FLAVOR[q.difficulty] or "",
+                req        = (#reqParts > 0) and table.concat(reqParts, ", ") or "cualquiera",
+                ok         = okReq and true or false,
+                reqMsg     = okReq and "" or (reqMsg or "Requisitos no cumplidos."),
+            }
+        end
+
+        -- misiones bloqueadas por cooldown de lista
+        local t = QuestListCD[guidStr]
+        if t then
+            local now = os.time()
+            for qid, exp in pairs(t) do
+                local rem = (exp or 0) - now
+                if rem > 0 then
+                    local q = FindQuest(qid)
+                    payload.listCD[#payload.listCD + 1] = {
+                        name = (q and q.name) or ("Mision #" .. tostring(qid)),
+                        diff = (q and q.difficulty) or "NORMAL",
+                        rem  = rem,
+                    }
+                end
+            end
+            table.sort(payload.listCD, function(a, b) return a.rem < b.rem end)
+            while #payload.listCD > 12 do table.remove(payload.listCD) end
+        end
+    end
+
+    return payload
 end
 
-function BGHandlers.claimMission(player)
-    ClaimMission(player)
-    SendMissionStatus(player)
+local function SendBoard(player, open)
+    local ok, payload = pcall(BuildBoardPayload, player, open)
+    if not ok then
+        print("[BotGarrison] Error construyendo el tablon: " .. tostring(payload))
+        return false
+    end
+    AIO.Handle(player, "BotGarrison", "BoardData", payload)
+    return true
 end
 
-print("[BotGarrison] v0.7.7 cargado — anti-summon en mision + AIO")
+-- Llamado desde OnGossipHello: abre el panel en lugar del menu de gossip
+BoardOpen = function(player)
+    return SendBoard(player, true)
+end
+
+-- Reenvia el tablon un momento despues (los bots estan volviendo/aparcandose y los
+-- objetos del jugador no deben reutilizarse entre eventos: se vuelve a buscar por GUID).
+local function SendBoardLater(player, ms)
+    local guid = player:GetGUID()
+    CreateLuaEvent(Guard("board-later", function()
+        local p = GetPlayerByGUID(guid)
+        if p then SendBoard(p, false) end
+    end), ms or 1200, 1)
+end
+
+-- Refrescar sin barajar las ofertas
+BGHandlers.requestBoard = Guard("requestBoard", function(player)
+    SendBoard(player, false)
+end)
+
+BGHandlers.startMission = Guard("startMission", function(player, index)
+    local guidStr = GuidKey(player)
+    local s = BoardSession[guidStr]
+    index = tonumber(index)
+    if not s or not s.list or not index or not s.list[index] then
+        player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Vuelve a pulsar el tablon para ver las misiones.")
+        SendBoard(player, false)
+        return
+    end
+    if not BoardNear(player, s) then
+        player:SendBroadcastMessage("|cffff8800[BotGarrison]|r Debes estar junto al tablon de misiones para enviar a tus companeros.")
+        SendBoard(player, false)
+        return
+    end
+    local started = StartMission(player, s.list[index])
+    if started ~= false then
+        s.list = nil
+        -- StartMission ya envia el estado (mision activa); el tablon se actualiza luego
+        SendBoardLater(player, 1500)
+    else
+        SendBoard(player, false)
+    end
+end)
+
+BGHandlers.claimMission = Guard("claimMission", function(player)
+    ClaimMission(player)   -- ya envia el estado (UpdateStatus) al terminar
+    local s = BoardSession[GuidKey(player)]
+    if s then s.list = nil end
+    SendBoardLater(player, 1200)
+end)
+
+BGHandlers.cancelMission = Guard("cancelMission", function(player)
+    CancelMission(player)  -- ya envia el estado (UpdateStatus) al terminar
+    local s = BoardSession[GuidKey(player)]
+    if s then s.list = nil end
+    SendBoardLater(player, 1200)
+end)
+
+print("[BotGarrison] v0.8.0 cargado — panel de tablon AIO")
