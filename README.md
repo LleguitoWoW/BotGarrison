@@ -193,3 +193,7 @@ Tablón por defecto: mapa Zul'Aman (`displayId 222`).
 Evolución de la idea de **BotQuest** (misiones para NPCBots), adaptada a **Playerbots** y a un flujo nativo tipo garrison con mapa en ciudad, sin addon obligatorio.
 
 Evolution of the **BotQuest** idea (missions for NPCBots), adapted to **Playerbots** and a native garrison-style city map flow, with no required addon.
+
+<img width="960" height="716" alt="2" src="https://github.com/user-attachments/assets/34d9e412-f985-4c3a-bf81-9eb8b9079044" />
+
+
