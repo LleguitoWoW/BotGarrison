@@ -290,4 +290,5 @@ Al inicio de `CFG` en `BotGarrison_Server.lua`:
 - El diario está en el cliente: cambiar de ordenador o borrar la carpeta `WTF` lo pierde.
 
 
-<img width="960" height="716" alt="2" src="https://github.com/user-attachments/assets/34d9e412-f985-4c3a-bf81-9eb8b9079044" />
+<img width="1037" height="691" alt="1" src="https://github.com/user-attachments/assets/0af56544-a4c4-42e6-8504-becbb8ce8d6d" />
+
