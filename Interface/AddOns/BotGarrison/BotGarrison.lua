@@ -244,13 +244,15 @@ UI.groupPanel = MakePanel(UI.main, 18, -94, PANEL_W, 60)
 
 UI.g1 = UI.groupPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 UI.g1:SetPoint("TOPLEFT", 12, -8)
-UI.g1:SetWidth(PANEL_W - 24)
+UI.g1:SetWidth(PANEL_W - 24 - 104)
+UI.g1:SetHeight(14)
 UI.g1:SetJustifyH("LEFT")
 UI.g1:SetText("")
 
 UI.g2 = UI.groupPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 UI.g2:SetPoint("TOPLEFT", 12, -26)
-UI.g2:SetWidth(PANEL_W - 24)
+UI.g2:SetWidth(PANEL_W - 24 - 104)
+UI.g2:SetHeight(12)
 UI.g2:SetJustifyH("LEFT")
 UI.g2:SetText("")
 
@@ -259,6 +261,39 @@ UI.g3:SetPoint("TOPLEFT", 12, -42)
 UI.g3:SetWidth(PANEL_W - 24)
 UI.g3:SetJustifyH("LEFT")
 UI.g3:SetText("")
+
+-- Iconos de rol (Tank / Healer / DPS) con el numero del grupo debajo
+UI.roleBlocks = {}
+do
+    local ROLES = {
+        { key = "tanks",   name = "Tanks",    coords = { 0.5,  0.75, 0, 1 }, col = "|cff4da6ff" },
+        { key = "healers", name = "Sanadores", coords = { 0.75, 1.0,  0, 1 }, col = "|cff33ff66" },
+        { key = "dps",     name = "DPS",       coords = { 0.25, 0.5,  0, 1 }, col = "|cffff6666" },
+    }
+    for i, r in ipairs(ROLES) do
+        local f = CreateFrame("Frame", nil, UI.groupPanel)
+        f:SetSize(32, 46)
+        f:SetPoint("TOPRIGHT", UI.groupPanel, "TOPRIGHT", -8 - (3 - i) * 33, -6)
+        f:EnableMouse(true)
+        f.icon = f:CreateTexture(nil, "ARTWORK")
+        f.icon:SetSize(28, 28)
+        f.icon:SetPoint("TOP", 0, 0)
+        f.icon:SetTexture("Interface\\LFGFrame\\LFGRole")
+        f.icon:SetTexCoord(unpack(r.coords))
+        f.num = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        f.num:SetPoint("TOP", f.icon, "BOTTOM", 0, -1)
+        f.num:SetText("0")
+        f.roleKey, f.roleName, f.roleCol = r.key, r.name, r.col
+        f:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:SetText(self.roleName, 1, 1, 1)
+            GameTooltip:AddLine("En tu destacamento: " .. (self.count or 0), 0.8, 0.8, 0.8)
+            GameTooltip:Show()
+        end)
+        f:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        UI.roleBlocks[i] = f
+    end
+end
 
 -- Lista de ofertas
 UI.listPanel = MakePanel(UI.main, 18, -160, PANEL_W, 178)
@@ -776,11 +811,18 @@ local function PopulateBoard()
     local g = b.group or {}
 
     UI.g1:SetText(string.format(
-        "|cffffd100Destacamento|r  |cffffffff%d/%d|r compañeros     |cff4da6ffT%d|r  |cff33ff66H%d|r  |cffff6666D%d|r",
-        g.bots or 0, g.max or 4, g.tanks or 0, g.healers or 0, g.dps or 0))
+        "|cffffd100Destacamento|r  |cffffffff%d/%d|r compañeros",
+        g.bots or 0, g.max or 4))
+    for _, f in ipairs(UI.roleBlocks) do
+        local n = g[f.roleKey] or 0
+        f.count = n
+        f.num:SetText((n > 0 and f.roleCol or "|cff666666") .. n .. "|r")
+        f.icon:SetDesaturated(n == 0)
+        f.icon:SetAlpha(n > 0 and 1 or 0.45)
+    end
     UI.g2:SetText(string.format(
-        "|cffaaaaaaGS medio|r |cffffffff%d|r   |cffaaaaaaCapitán|r |cffffffff%d|r   |cffaaaaaaPoder|r |cffffffff%.1f|r",
-        g.gs or 0, g.captain or 0, g.power or 0))
+        "|cffaaaaaaGS medio|r |cffffffff%d|r|cff888888/%d|r   |cffaaaaaaCapitán|r |cffffffff%d|r   |cffaaaaaaPoder|r |cffffffff%.1f|r",
+        g.gs or 0, g.minGs or 0, g.captain or 0, g.power or 0))
     UI.UpdateGroupExtras()
 
     local offers = b.offers or {}

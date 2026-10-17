@@ -47,6 +47,23 @@ local CFG = {
     MAX_SUCCESS = 0.95,
     MIN_SUCCESS = 0.05,
 
+    -- ===== AJUSTE DE DIFICULTAD (formula mas estricta o mas flexible) =====
+    -- Se suma al % final de TODAS las misiones. Ej: -0.10 = 10 puntos mas dificil, +0.10 = mas facil.
+    SUCCESS_OFFSET = 0.0,
+    -- Ajuste extra por dificultad (se suma al anterior). Ej: ELITE = -0.05 para endurecer solo las elite.
+    DIFFICULTY_ADJUST = { EASY = 0.0, NORMAL = 0.0, HARD = 0.0, ELITE = 0.0 },
+    -- Multiplica el poder total del grupo: <1 = el equipo pesa menos (mas estricto), >1 = pesa mas.
+    POWER_MULT = 1.0,
+    -- false = desactiva por completo la penalizacion y el tope por "equipo bajo".
+    UNDERGEARED_ENABLED = true,
+
+    -- ===== ROLES (tank / healer / dps) =====
+    -- El rol se detecta por los talentos del bot (hechizos de rama profunda).
+    -- Si no se puede saber: "DPS" (defecto) o "CLASS" (asumir por clase: sacerdote/chaman/druida = healer...).
+    UNKNOWN_SPEC_ROLE = "DPS",
+    -- Forzar el rol de un bot concreto: { ["Aheen"] = "DPS", ["Kelken"] = "HEAL" }  (TANK / HEAL / DPS)
+    BOT_ROLE_OVERRIDE = {},
+
     FAIL_COOLDOWN_SECS = { EASY = 120, NORMAL = 300, HARD = 600, ELITE = 1200 },
 
     CLASS_ROLE_WEIGHT = {
@@ -72,6 +89,17 @@ local CFG = {
 
     -- Tope de éxito si el grupo está undergeared (media bajo el mínimo)
     UNDERGEARED_MAX_SUCCESS = 0.40,
+
+    -- Si el core no da GearScore, estimarlo sumando el ilvl del equipo puesto
+    -- (si tampoco se puede leer el equipo, se trata como "justo el minimo": no penaliza)
+    GS_ESTIMATE_FROM_ITEMS = true,
+    -- Origen del GS: "items" (defecto) = sumar el ilvl del equipo puesto; "api" = usar el GS del core.
+    -- Si usas "api" y tu core devuelve un ilvl MEDIO (valores como 37 o 120), sube GS_API_SCALE
+    -- (~17) para pasarlo a escala de GearScore.
+    GS_SOURCE              = "items",
+    GS_API_SCALE           = 1,
+    -- Minimo por nivel cuando el GS se ESTIMA por objetos (suma de ilvl del equipo puesto)
+    MIN_ITEMS_PER_LEVEL    = 8,
 
     -- Oro: goldMin/Max del QUEST se multiplican por nivel del jugador
     -- final ≈ random(min,max) * level * GOLD_LEVEL_MULT  (en cobre)
@@ -112,6 +140,24 @@ local CFG = {
     LOGOUT_DELAY_MS = 500,
     LOGIN_DELAY_MS  = 1000,
     PARK_DELAY_MS   = 300,
+
+    -- ===== EFECTO DE PARTIDA (estilo "portal de mago") =====
+    -- Tras el saludo el bot se carga de energia arcana, se desvanece y recien entonces se va.
+    -- Si las mochilas estan llenas al reclamar, el objeto se envia por correo
+    MAIL_REWARD_IF_BAGS_FULL = true,
+
+    DEPART_FX = true,
+    -- Hechizos VISUALES que el bot se lanza a si mismo al "cargar" (se lanzan sin coste ni cooldown).
+    -- 12042 = Poder Arcano (aura brillante). Prueba otros IDs de hechizos con efecto visual si quieres.
+    DEPART_FX_CHARGE = { 12042 },
+    -- Hechizos visuales extra justo antes de irse (destello). Vacio por defecto; ej: { 642 }
+    DEPART_FX_BURST = {},
+    -- Aura de desvanecimiento (66 = Invisibilidad: el bot se vuelve translucido y desaparece). nil = sin fundido.
+    DEPART_FX_FADE = 66,
+    -- Tiempos en ms desde que se pulsa "Enviar": carga / fundido / teletransporte
+    DEPART_FX_CHARGE_AT = 2400,
+    DEPART_FX_FADE_AT   = 3300,
+    DEPART_FX_TELEPORT_AT = 4500,
 
     -- Bloquear summon/follow de bots en mision
     BLOCK_SUMMON_WHILE_MISSION = true,
@@ -1431,31 +1477,114 @@ local function SafeIsAltBot(unit)
     return false
 end
 
-local function SafeIsHealer(unit)
-    if unit.IsHealer then
-        local ok, res = pcall(function() return unit:IsHealer() end)
-        if ok and res then return true end
+-- Firmas de talentos por clase (IDs de hechizo de talentos de rama profunda, todos los rangos).
+-- Si el bot conoce alguna, sabemos su rama. Un ID incorrecto solo significa "no coincide".
+local ROLE_SIGS = {
+    [5] = { -- Sacerdote
+        HEAL = {20711,724,27870,27871,28275,34861,34863,34864,34865,34866,47788,33206,10060,47540,53005,53006,53007,14751},
+        DPS  = {15473,34914,34916,34917,48159,48160,15407,17311,17312,17313,17314,18807,25387,48155,48156,47585},
+    },
+    [11] = { -- Druida
+        HEAL = {17116,18562,33891,48438,53248,53249,53251},
+        DPS  = {24858,48505,53199,53200,53201,33831,50516,53223,53225,53226,61384},
+    },
+    [7] = { -- Chaman
+        HEAL = {16188,16190,974,32593,32594,49283,49284,61295,61299,61300,61301},
+        DPS  = {16166,51490,59156,59158,59159,17364,51533,60103,30823},
+    },
+    [2] = { -- Paladin
+        HEAL = {20216,31842,53563,20473,20929,20930,27174,33072,48824,48825},
+        TANK = {20925,20927,20928,27179,48951,48952,31935,32699,32700,48826,48827,53595},
+        DPS  = {35395,53385,20066},
+    },
+    [1] = { -- Guerrero
+        TANK = {12809,50720,46968,20243,30016,30022,47497,47498,23922,23923,23924,23925,25258,30356,47487,47488},
+    },
+    [6] = { -- Caballero de la Muerte
+        TANK = {55233,49028,55050,55258,55259,55260,55261,55262},
+    },
+}
+
+local function BotKnows(unit, ids)
+    local n = 0
+    for _, id in ipairs(ids or {}) do
+        local ok, has = pcall(function() return unit:HasSpell(id) end)
+        if ok and has then n = n + 1 end
     end
-    local cls = unit:GetClass()
-    return cls == 2 or cls == 5 or cls == 7 or cls == 11
+    return n
 end
 
-local function SafeIsTank(unit)
-    if unit.IsMainTank then
-        local ok, res = pcall(function() return unit:IsMainTank() end)
-        if ok and res then return true end
+--- Devuelve rol ("TANK"/"HEAL"/"DPS") y de donde sale ("manual","talentos","api","clase").
+local function GetBotRole(unit)
+    -- 1) Forzado a mano en CFG.BOT_ROLE_OVERRIDE = { ["Nombre"] = "DPS" }
+    local okN, name = pcall(function() return unit:GetName() end)
+    local ov = okN and CFG.BOT_ROLE_OVERRIDE and CFG.BOT_ROLE_OVERRIDE[name]
+    if ov then
+        ov = string.upper(tostring(ov))
+        if ov == "HEALER" then ov = "HEAL" end
+        if ov == "TANK" or ov == "HEAL" or ov == "DPS" then return ov, "manual" end
     end
-    if unit.IsAssistTank then
-        local ok, res = pcall(function() return unit:IsAssistTank() end)
-        if ok and res then return true end
-    end
+
     local cls = unit:GetClass()
-    return cls == 1 or cls == 2 or cls == 6 or cls == 11
+    local sigs = ROLE_SIGS[cls]
+
+    -- 2) Talentos: gana la rama con mas coincidencias; empate -> DPS
+    if sigs and unit.HasSpell then
+        local best, bestN, tie = nil, 0, false
+        for _, role in ipairs({ "TANK", "HEAL", "DPS" }) do
+            local n = BotKnows(unit, sigs[role])
+            if n > bestN then best, bestN, tie = role, n, false
+            elseif n == bestN and n > 0 then tie = true end
+        end
+        if best and not tie then return best, "talentos" end
+        if best and tie then return "DPS", "talentos" end
+    end
+
+    -- 3) Marcas de tank que pone playerbots (si el core las expone)
+    for _, fn in ipairs({ "IsMainTank", "IsAssistTank" }) do
+        if unit[fn] then
+            local ok, res = pcall(function() return unit[fn](unit) end)
+            if ok and res then return "TANK", "api" end
+        end
+    end
+
+    -- 4) Sin datos de talentos: por defecto DPS (antes se asumia sanador/tanque por clase)
+    local unk = string.upper(CFG.UNKNOWN_SPEC_ROLE or "DPS")
+    if unk == "CLASS" then
+        if cls == 5 or cls == 7 or cls == 11 then return "HEAL", "clase" end
+        if cls == 1 or cls == 2 or cls == 6 then return "TANK", "clase" end
+    end
+    return "DPS", "sin-datos"
 end
 
-local function SafeGearScore(unit)
-    if not unit then return 0 end
-    -- API playerbots / cores con GearScore
+local function SafeIsHealer(unit) return (GetBotRole(unit)) == "HEAL" end
+local function SafeIsTank(unit) return (GetBotRole(unit)) == "TANK" end
+
+-- Casillas de equipo que cuentan (sin camisa ni tabardo)
+local GS_EQUIP_SLOTS = { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 }
+
+--- Estima el "GS" sumando el nivel de objeto (ilvl) de lo que lleva equipado.
+--- Devuelve nil si la API de objetos no esta disponible.
+local function EstimateGearFromItems(unit)
+    if not unit.GetEquippedItemBySlot then return nil end
+    local total, apiWorked = 0, false
+    for _, slot in ipairs(GS_EQUIP_SLOTS) do
+        local ok, item = pcall(function() return unit:GetEquippedItemBySlot(slot) end)
+        if ok then
+            apiWorked = true
+            if item then
+                local okL, ilvl = pcall(function() return item:GetItemLevel() end)
+                if okL and type(ilvl) == "number" then total = total + ilvl end
+            end
+        end
+    end
+    if not apiWorked then return nil end
+    return total
+end
+
+--- Lee el GS que da el core (si existe). OJO: su escala no esta garantizada: en playerbots
+--- suele ser un nivel de objeto MEDIO (30-200), no un GearScore (cientos o miles).
+local function ReadGsApi(unit)
     if unit.GetMixedGearScore then
         local ok, gs = pcall(function() return unit:GetMixedGearScore(false, false, 0) end)
         if ok and type(gs) == "number" and gs > 0 then return gs end
@@ -1466,8 +1595,29 @@ local function SafeGearScore(unit)
         local ok, gs = pcall(function() return unit:GetGearScore() end)
         if ok and type(gs) == "number" and gs > 0 then return gs end
     end
-    -- Fallback: nivel * 10 (solo si no hay API de GS)
-    return (unit:GetLevel() or 1) * 10
+    return nil
+end
+
+--- Devuelve gs, origen, valorApi. Origen: "items" | "gs-api" | "neutral".
+---  - "items": suma del ilvl del equipo puesto (escala de GearScore: ~17 casillas x ilvl).
+---    Es la escala para la que estan ajustados MIN_GS_PER_LEVEL y GS_DIVISOR.
+---  - "gs-api": GS del core multiplicado por GS_API_SCALE (solo si no se puede leer el equipo).
+---  - "neutral": no hay forma de medir: se considera justo el minimo (no penaliza).
+local function SafeGearScore(unit)
+    if not unit then return 0, "none", nil end
+    local api = ReadGsApi(unit)
+    local est = nil
+    if CFG.GS_SOURCE ~= "api" and CFG.GS_ESTIMATE_FROM_ITEMS ~= false then
+        est = EstimateGearFromItems(unit)
+    end
+
+    if CFG.GS_SOURCE == "api" and api then
+        return api * (CFG.GS_API_SCALE or 1), "gs-api", api
+    end
+    if est and est > 0 then return est, "items", api end
+    if api then return api * (CFG.GS_API_SCALE or 1), "gs-api", api end
+    if est == 0 then return 0, "items", api end   -- se pudo leer y esta desnudo
+    return (unit:GetLevel() or 1) * (CFG.MIN_GS_PER_LEVEL or 15), "neutral", nil
 end
 
 --- Devuelve lista de altbots del jugador (grupo + mgr)
@@ -1569,6 +1719,23 @@ local function BotSalute(unit, label)
     return ok
 end
 
+--- Lanza una lista de hechizos visuales sobre el propio bot (ignora los que fallen).
+local function FxCastSelf(unit, list)
+    for _, id in ipairs(list or {}) do
+        pcall(function() unit:CastSpell(unit, id, true) end)
+    end
+end
+
+--- Quita los auras del efecto de partida (por si siguen puestas al volver).
+local function FxClear(unit)
+    if not unit then return end
+    pcall(function()
+        if CFG.DEPART_FX_FADE then unit:RemoveAura(CFG.DEPART_FX_FADE) end
+        for _, id in ipairs(CFG.DEPART_FX_CHARGE or {}) do unit:RemoveAura(id) end
+        for _, id in ipairs(CFG.DEPART_FX_BURST or {}) do unit:RemoveAura(id) end
+    end)
+end
+
 --- Aparca bots lejos (modo park) o logout (modo logout)
 local function DismissBotsOnMission(player, bots)
     local mode = CFG.BOT_MISSION_MODE or "park"
@@ -1661,14 +1828,32 @@ local function DismissBotsOnMission(player, bots)
                     BotSalute(b, botName)
                 end), faceOn and 1100 or 500, 1)
 
-                -- 4) Teleport al aparcamiento cuando el saludo ya termino
+                -- 4) Efecto de partida: cargar -> desvanecer -> irse
+                local fx = (CFG.DEPART_FX ~= false)
+                if fx then
+                    CreateLuaEvent(Guard("fx-charge", function()
+                        local b = findBot()
+                        if b then FxCastSelf(b, CFG.DEPART_FX_CHARGE) end
+                    end), CFG.DEPART_FX_CHARGE_AT or 2400, 1)
+                    CreateLuaEvent(Guard("fx-fade", function()
+                        local b = findBot()
+                        if not b then return end
+                        FxCastSelf(b, CFG.DEPART_FX_BURST)
+                        if CFG.DEPART_FX_FADE then
+                            pcall(function() b:CastSpell(b, CFG.DEPART_FX_FADE, true) end)
+                        end
+                    end), CFG.DEPART_FX_FADE_AT or 3300, 1)
+                end
+
+                -- 5) Teleport al aparcamiento cuando el saludo (y el efecto) ya terminaron
                 CreateLuaEvent(Guard("park-teleport", function()
                     local b = findBot()
                     if not b then return end
+                    if fx then FxClear(b) end
                     pcall(function()
                         b:Teleport(CFG.PARK_MAP or 13, CFG.PARK_X or 0, CFG.PARK_Y or 0, CFG.PARK_Z or 0, CFG.PARK_O or 0)
                     end)
-                end), 3500, 1)
+                end), fx and (CFG.DEPART_FX_TELEPORT_AT or 4500) or 3500, 1)
                 print(string.format("[BotGarrison] Park bot '%s' → map %s (salute)", info.name, tostring(CFG.PARK_MAP)))
             elseif mode == "logout" then
                 local done = false
@@ -1734,6 +1919,7 @@ local function RecallBotsFromMission(player, mission)
             -- Buscar bots online (siguen logueados en el mapa park) y traerlos
             local function tryTeleportBot(bot, name)
                 if not bot then return false end
+                FxClear(bot)
                 local ok = pcall(function()
                     bot:Teleport(pmap, px + math.random(-3, 3), py + math.random(-3, 3), pz, po)
                 end)
@@ -1805,24 +1991,10 @@ end
 local function CountBotRoles(bots)
     local tanks, healers, dps = 0, 0, 0
     for _, bot in ipairs(bots or {}) do
-        local isT = SafeIsTank(bot)
-        local isH = SafeIsHealer(bot)
-        -- Si es tank y healer (p.ej. pala), cuenta tank prioritario si IsMainTank, si no heal
-        if isT and isH then
-            if bot.IsMainTank then
-                local ok, mt = pcall(function() return bot:IsMainTank() end)
-                if ok and mt then tanks = tanks + 1
-                else healers = healers + 1 end
-            else
-                tanks = tanks + 1 -- por defecto tank dual-spec ambiguo
-            end
-        elseif isT then
-            tanks = tanks + 1
-        elseif isH then
-            healers = healers + 1
-        else
-            dps = dps + 1
-        end
+        local role = GetBotRole(bot)
+        if role == "TANK" then tanks = tanks + 1
+        elseif role == "HEAL" then healers = healers + 1
+        else dps = dps + 1 end
     end
     return tanks, healers, dps
 end
@@ -1863,15 +2035,21 @@ local function CalculateGroupPower(player, bots)
     -- GS de los altbots que van a la mision
     local totalGs, totalMin = 0, 0
     local gsDebug = {}
+    local srcSet, srcCount = {}, 0
 
     for _, bot in ipairs(bots) do
         botCount = botCount + 1
         local okN, name = pcall(function() return bot:GetName() end)
         local lvl = bot:GetLevel() or 1
-        local gs = SafeGearScore(bot)
+        local gs, gsSrc, gsApi = SafeGearScore(bot)
+        local roleN, roleSrc = GetBotRole(bot)
         totalGs = totalGs + gs
-        totalMin = totalMin + (lvl * (CFG.MIN_GS_PER_LEVEL or 15))
-        gsDebug[#gsDebug+1] = string.format("%s=%d", okN and name or "?", gs)
+        -- Si el GS es una estimacion por objetos (suma de ilvl) el minimo es mas bajo:
+        -- un bot con ~la mitad de casillas al nivel de su ilvl ya cuenta como equipado.
+        local minPerLevel = (gsSrc == "items") and (CFG.MIN_ITEMS_PER_LEVEL or 8) or (CFG.MIN_GS_PER_LEVEL or 15)
+        totalMin = totalMin + (lvl * minPerLevel)
+        if gsSrc and not srcSet[gsSrc] then srcSet[gsSrc] = true; srcCount = srcCount + 1 end
+        gsDebug[#gsDebug+1] = string.format("%s=%d(%s,api=%s,rol=%s/%s)", okN and name or "?", gs, gsSrc or "?", tostring(gsApi), roleN, roleSrc)
 
         local cls = bot:GetClass()
         local weight = CFG.CLASS_ROLE_WEIGHT[cls] or CFG.DEFAULT_ROLE_WEIGHT
@@ -1884,7 +2062,7 @@ local function CalculateGroupPower(player, bots)
 
     local avgGs = (botCount > 0) and (totalGs / botCount) or 0
     local avgMinGs = (botCount > 0) and (totalMin / botCount) or 0
-    local undergeared = botCount > 0 and avgGs < avgMinGs
+    local undergeared = CFG.UNDERGEARED_ENABLED ~= false and botCount > 0 and avgGs < avgMinGs
 
     local gearBonus = avgGs / (CFG.GS_DIVISOR or 35)
     if undergeared then
@@ -1893,7 +2071,7 @@ local function CalculateGroupPower(player, bots)
     power = power + gearBonus
 
     -- Poder del Capitan: GS del jugador (aura ficticia de liderazgo)
-    local captainGs = SafeGearScore(player)
+    local captainGs, captainSrc, captainApi = SafeGearScore(player)
     local captainMult = CFG.CAPTAIN_POWER_MULT or 0.75
     local captainBonus = (captainGs / (CFG.GS_DIVISOR or 35)) * captainMult
     power = power + captainBonus
@@ -1903,18 +2081,23 @@ local function CalculateGroupPower(player, bots)
     end
 
     print(string.format(
-        "[BotGarrison] GS bots (%d): %s | media=%.1f (min=%.1f) under=%s | Capitan GS=%d (+%.1f poder) | power=%.1f",
+        "[BotGarrison] GS bots (%d): %s | media=%.1f (min=%.1f) under=%s | Capitan GS=%d(%s,api=%s) (+%.1f poder) | power=%.1f",
         botCount, table.concat(gsDebug, ", "), avgGs, avgMinGs, tostring(undergeared),
-        captainGs, captainBonus, power
+        captainGs, captainSrc or "?", tostring(captainApi), captainBonus, power
     ))
 
-    return power, hasTank, hasHealer, botCount, bots, undergeared, avgGs, captainGs
+    local srcSummary = "?"
+    if srcCount == 1 then srcSummary = next(srcSet)
+    elseif srcCount > 1 then srcSummary = "mixto" end
+
+    return power, hasTank, hasHealer, botCount, bots, undergeared, avgGs, captainGs, avgMinGs, srcSummary
 end
 
 local function CalculateSuccessChance(power, difficulty, undergeared)
     local base = CFG.BASE_SUCCESS[difficulty] or 0.20
-    local bonus = power * (CFG.POWER_PER_POINT or 0.025)
-    local chance = base + bonus
+    local bonus = power * (CFG.POWER_MULT or 1.0) * (CFG.POWER_PER_POINT or 0.025)
+    local chance = base + bonus + (CFG.SUCCESS_OFFSET or 0)
+    chance = chance + ((CFG.DIFFICULTY_ADJUST or {})[difficulty] or 0)
     local maxS = CFG.MAX_SUCCESS or 0.95
     local minS = CFG.MIN_SUCCESS or 0.05
     if undergeared then
@@ -2261,7 +2444,28 @@ local function DeliverRewards(player, mission)
     player:ModifyMoney(gold)
 
     local itemId, itemName, quality = PickRandomItemForLevel(level)
-    player:AddItem(itemId, 1)
+    -- Entrega el objeto; si las mochilas estan llenas, se envia por correo
+    local before = 0
+    if player.GetItemCount then
+        local okC, c = pcall(function() return player:GetItemCount(itemId) end)
+        if okC and type(c) == "number" then before = c end
+    end
+    local okA, res = pcall(function() return player:AddItem(itemId, 1) end)
+    local stored
+    if player.GetItemCount then
+        local okC, c = pcall(function() return player:GetItemCount(itemId) end)
+        if okC and type(c) == "number" then stored = c > before end
+    end
+    if stored == nil then stored = okA and res ~= nil and res ~= false end
+    local mailed = false
+    if not stored and CFG.MAIL_REWARD_IF_BAGS_FULL ~= false and SendMail then
+        mailed = pcall(function()
+            SendMail("Botín de misión",
+                "Tus compañeros completaron: " .. tostring(mission.questName or "?") ..
+                ".\nTus mochilas estaban llenas, así que te enviamos el botín por correo.",
+                player:GetGUIDLow(), 0, 41, 0, 0, 0, itemId, 1)
+        end)
+    end
 
     local qColor = QUALITY_COLOR[quality] or "|cffffffff"
     local qName  = QUALITY_NAME[quality] or ""
@@ -2271,6 +2475,12 @@ local function DeliverRewards(player, mission)
         math.floor(gold/10000), math.floor((gold%10000)/100), gold%100))
     player:SendBroadcastMessage(string.format("  |cffffcc00Item:|r %s[%s]|r |cff888888(%s)|r",
         qColor, itemName, qName))
+    if mailed then
+        player:SendBroadcastMessage("|cffffcc00[BotGarrison]|r Mochilas llenas: el objeto te ha llegado por |cffffffffcorreo|r.")
+    elseif not stored then
+        print("[BotGarrison] AVISO: no se pudo entregar el item " .. tostring(itemId) .. " (mochilas llenas y correo no disponible)")
+        player:SendBroadcastMessage("|cffff4444[BotGarrison]|r Mochilas llenas: no se pudo entregar el objeto.")
+    end
 
     GrantMissionXP(player, mission)
     return gold, itemId, itemName, quality
@@ -3137,7 +3347,7 @@ local function BuildBoardPayload(player, open)
     EnsureMissionLoaded(player)
 
     local bots = GetAltBots(player)
-    local power, _, _, botCount, _, undergeared, avgGs, captainGs = CalculateGroupPower(player, bots)
+    local power, _, _, botCount, _, undergeared, avgGs, captainGs, avgMinGs, gsSrc = CalculateGroupPower(player, bots)
     local tanks, healers, dps = CountBotRoles(bots)
 
     local payload = {
@@ -3154,6 +3364,8 @@ local function BuildBoardPayload(player, open)
             healers  = healers or 0,
             dps      = dps or 0,
             gs       = math.floor(avgGs or 0),
+            minGs    = math.floor(avgMinGs or 0),
+            gsSrc    = gsSrc or "?",
             captain  = math.floor(captainGs or 0),
             power    = math.floor((power or 0) * 10) / 10,
             under    = undergeared and true or false,
