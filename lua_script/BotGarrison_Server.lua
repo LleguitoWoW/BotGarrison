@@ -143,6 +143,13 @@ local CFG = {
 
     -- ===== EFECTO DE PARTIDA (estilo "portal de mago") =====
     -- Tras el saludo el bot se carga de energia arcana, se desvanece y recien entonces se va.
+    -- ===== LLEGADA CON TRASLACION (Blink) =====
+    -- Al reclamar, el bot aparece a unas yardas de ti, de frente, y salta hasta tu lado con Traslacion.
+    ARRIVE_BLINK = true,
+    ARRIVE_BLINK_SPELL = 1953,     -- Traslacion (Blink)
+    ARRIVE_BLINK_DIST = 18,        -- yardas de distancia a las que aparece (Blink avanza ~20)
+    ARRIVE_BLINK_DELAY_MS = 900,   -- espera antes de saltar (el bot tarda en aparecer)
+
     -- Si las mochilas estan llenas al reclamar, el objeto se envia por correo
     MAIL_REWARD_IF_BAGS_FULL = true,
 
@@ -1920,17 +1927,68 @@ local function RecallBotsFromMission(player, mission)
             local function tryTeleportBot(bot, name)
                 if not bot then return false end
                 FxClear(bot)
-                local ok = pcall(function()
-                    bot:Teleport(pmap, px + math.random(-3, 3), py + math.random(-3, 3), pz, po)
-                end)
-                -- Orden AI follow (silencioso)
-                pcall(function()
-                    if mgr and mgr.HandlePlayerbotCommand then
-                        mgr:HandlePlayerbotCommand("bot " .. name .. " follow")
+                local blink = (CFG.ARRIVE_BLINK ~= false)
+                local dist  = CFG.ARRIVE_BLINK_DIST or 18
+                local tx, ty, tz, to = px + math.random(-3, 3), py + math.random(-3, 3), pz, po
+                if blink then
+                    local ang = po + math.pi + (math.random() - 0.5) * 1.6   -- detras de ti, con algo de dispersion
+                    tx, ty = px + dist * math.cos(ang), py + dist * math.sin(ang)
+                    tz = pz
+                    pcall(function()
+                        local map = p:GetMap()
+                        if map and map.GetHeight then
+                            local h = map:GetHeight(tx, ty)
+                            if type(h) == "number" and h > -500 and math.abs(h - pz) < 15 then tz = h + 0.5 end
+                        end
+                    end)
+                    to = math.atan2(py - ty, px - tx)   -- mirando hacia ti
+                end
+                local ok = pcall(function() bot:Teleport(pmap, tx, ty, tz, to) end)
+
+                local botGuid = bot:GetGUID()
+                local function refind()
+                    local b = GetPlayerByGUID and GetPlayerByGUID(botGuid) or nil
+                    if not b and GetPlayerByName then
+                        local okB, bb = pcall(function() return GetPlayerByName(name) end)
+                        if okB then b = bb end
                     end
-                end)
-                BotSalute(bot, name)
-                print(string.format("[BotGarrison] Recall park '%s' → %s (salute)", name, tostring(ok)))
+                    return b
+                end
+                local function followAndSalute(b)
+                    pcall(function()
+                        if mgr and mgr.HandlePlayerbotCommand then
+                            mgr:HandlePlayerbotCommand("bot " .. name .. " follow")
+                        end
+                    end)
+                    BotSalute(b, name)
+                end
+
+                if ok and blink then
+                    -- Saltar hacia ti con Traslacion; si no llega, se coloca a tu lado
+                    CreateLuaEvent(Guard("arrive-blink", function()
+                        local b = refind()
+                        local pl = GetPlayerByGUID(masterGuid)
+                        if not b or not pl then return end
+                        pcall(function() if b.SetFacingToObject then b:SetFacingToObject(pl) end end)
+                        pcall(function() b:CastSpell(b, CFG.ARRIVE_BLINK_SPELL or 1953, true) end)
+                        CreateLuaEvent(Guard("arrive-settle", function()
+                            local b2 = refind()
+                            local pl2 = GetPlayerByGUID(masterGuid)
+                            if not b2 or not pl2 then return end
+                            local okD, d = pcall(function() return b2:GetDistance(pl2) end)
+                            if okD and type(d) == "number" and d > 10 then
+                                pcall(function()
+                                    b2:Teleport(pl2:GetMapId(), pl2:GetX() + math.random(-2, 2),
+                                        pl2:GetY() + math.random(-2, 2), pl2:GetZ(), pl2:GetO())
+                                end)
+                            end
+                            followAndSalute(b2)
+                        end), 700, 1)
+                    end), CFG.ARRIVE_BLINK_DELAY_MS or 900, 1)
+                else
+                    followAndSalute(bot)
+                end
+                print(string.format("[BotGarrison] Recall park '%s' → %s (%s)", name, tostring(ok), blink and "blink" or "salute"))
                 return ok
             end
 
@@ -3510,4 +3568,4 @@ BGHandlers.cancelMission = Guard("cancelMission", function(player)
     SendBoardLater(player, 1200)
 end)
 
-print("[BotGarrison] v0.8.0 cargado — panel de tablon AIO")
+print("[BotGarrison] v0.8.0 cargado")
