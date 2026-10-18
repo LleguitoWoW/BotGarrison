@@ -1346,6 +1346,19 @@ local QUALITY_NAME    = { [1]="Común", [2]="Poco común", [3]="Raro" }
 
 local FailCooldowns  = {}   -- [guidStr] = expiry unix
 local ActiveMissions = {}   -- [guidStr] = mission table
+
+-- [BotJobs] ¿este bot esta en una mision activa? (lo consulta BotJobs)
+function BotGarrison_IsBotOnMission(guidLow)
+    guidLow = tostring(guidLow)
+    for _, m in pairs(ActiveMissions) do
+        if m and not m.cancelled and m.botGuids and m.botGuids ~= "" then
+            for g in string.gmatch(m.botGuids, "[^,]+") do
+                if g == guidLow then return true end
+            end
+        end
+    end
+    return false
+end
 local MissionLoaded  = {}   -- [guidStr] = true: ya se consulto la BD (el DELETE es asincrono; no releer)
 local QuestListCD    = {}   -- [guidStr] = { [questId] = expiry unix }
 local GossipContext  = {}   -- [guidStr] = { page, list }
@@ -1637,6 +1650,7 @@ local function GetAltBots(player)
         local g = bot:GetGUIDLow()
         if seen[g] or g == player:GetGUIDLow() then return end
         if not SafeIsAltBot(bot) then return end
+        if BotJobs_IsBotOnJob and BotJobs_IsBotOnJob(g) then return end   -- [BotJobs]
         seen[g] = true
         bots[#bots+1] = bot
     end
@@ -3568,4 +3582,4 @@ BGHandlers.cancelMission = Guard("cancelMission", function(player)
     SendBoardLater(player, 1200)
 end)
 
-print("[BotGarrison] v0.8.0 cargado")
+print("[BotGarrison] v0.8.0 cargado — panel de tablon AIO")
